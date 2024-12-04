@@ -1,35 +1,41 @@
 const express = require("express");
 const multer = require("multer");
 const tf = require("@tensorflow/tfjs-node");
-const fs = require("fs");
-const path = require("path");
+const cors = require("cors");
+const { Firestore } = require("@google-cloud/firestore"); // Import Firestore
 
 const app = express();
 const port = 3000;
 
-// Setup Multer to handle file upload and store in memory
-const storage = multer.memoryStorage(); // Store file in memory
+app.use(cors());
+
+// Inisialisasi Google Cloud Firestore
+const firestore = new Firestore({
+  keyFilename: "credentials.json", // Ganti dengan path ke credentials Google Cloud Anda
+});
+const db = firestore; // Gunakan db untuk mengakses Firestore
+
+// Setup Multer untuk menangani upload file
+const storage = multer.memoryStorage(); // Menyimpan file dalam memori
 const upload = multer({
   storage: storage,
-  limits: { fileSize: 1000000 }, // Limit file size to 1MB
+  limits: { fileSize: 1000000 }, // Membatasi ukuran file menjadi 1MB
 });
 
-// Function to load the TensorFlow model
-let model;
-
 async function loadModel() {
-  try {
-    model = await tf.loadGraphModel("file://submissions-model/model.json");
-    console.log("Model loaded successfully");
-  } catch (error) {
-    console.error("Error loading model: ", error);
-    throw new Error("Failed to load model.");
+    try {
+      // Pastikan path model Anda benar
+      model = await tf.loadGraphModel("file://submissions-model/model.json");
+      console.log("Model loaded successfully");
+    } catch (error) {
+      console.error("Error loading model: ", error);
+      throw new Error("Failed to load model.");
+    }
   }
-}
+  
+  loadModel(); // Memuat model saat aplikasi dimulai
 
-loadModel(); // Load the model when the application starts
-
-// Endpoint to accept image and make prediction
+// Endpoint untuk menerima gambar dan melakukan prediksi
 app.post("/predict", upload.single("image"), async (req, res) => {
   if (!req.file) {
     return res
@@ -38,7 +44,15 @@ app.post("/predict", upload.single("image"), async (req, res) => {
   }
 
   try {
-    // Multer already checks for file size, no need to check manually
+    // Menangani error jika ukuran file lebih dari 1MB
+    if (req.file.size > 1000000) {
+      return res.status(413).json({
+        status: "fail",
+        message: "Payload content length greater than maximum allowed: 1000000",
+      });
+    }
+
+    // Cek apakah file yang diupload adalah gambar
     if (!req.file.mimetype.startsWith("image/")) {
       return res
         .status(400)
@@ -51,39 +65,26 @@ app.post("/predict", upload.single("image"), async (req, res) => {
     // Resize image to 224x224 to match the model's input size
     imageTensor = tf.image.resizeBilinear(imageTensor, [224, 224]);
 
-    // Convert to RGB if image has 4 channels (RGBA)
-    if (imageTensor.shape[2] === 4) {
-      imageTensor = imageTensor.slice([0, 0, 0], [-1, -1, 3]); // Keep first 3 channels (RGB)
-    }
-
-    // Normalize image to range [0, 1]
+    // Normalisasi gambar ke rentang [0, 1]
     imageTensor = imageTensor.div(255.0);
 
-    // Ensure tensor has the correct shape: [batch_size, height, width, channels]
+    // Memastikan tensor memiliki dimensi yang benar
     if (imageTensor.shape.length === 3) {
-      imageTensor = imageTensor.expandDims(0); // Add batch dimension
+      imageTensor = imageTensor.expandDims(0); // Tambahkan batch dimension
     }
 
-    // Perform prediction using the model
+    // Lakukan prediksi menggunakan model
     const prediction = model.predict(imageTensor);
-
-    // Extract prediction result (assuming it's a binary classification)
     const predictionData = prediction.dataSync();
     const predictedValue = parseFloat(predictionData[0].toFixed(3));
 
-    // Debugging: log the prediction data
-    console.log("Prediction Data: ", predictedValue);
-
-    // Determine result based on the predicted value (threshold set to 0.58)
+    // Prediksi pertama (misalnya untuk "Cancer")
     const result = predictedValue > 0.58 ? "Cancer" : "Non-cancer";
-
-    // Suggestion based on the result
     const suggestion =
       result === "Cancer"
         ? "Segera periksa ke dokter!"
         : "Penyakit kanker tidak terdeteksi.";
 
-    // Save prediction result to a local JSON file
     const resultData = {
       id: generateUUID(),
       result: result,
@@ -91,68 +92,49 @@ app.post("/predict", upload.single("image"), async (req, res) => {
       createdAt: new Date().toISOString(),
     };
 
-    // Save to a local JSON file (appends to existing file if it exists)
-    const filePath = path.join(__dirname, "predictions.json");
-    const predictions = fs.existsSync(filePath)
-      ? JSON.parse(fs.readFileSync(filePath))
-      : [];
-    predictions.push(resultData);
-    fs.writeFileSync(filePath, JSON.stringify(predictions, null, 2));
+    // Simpan hasil prediksi ke Firestore
+    await savePredictionToFirestore(resultData);
 
-    // Respond with the prediction result
-    return res.json({
+    // Kembalikan response ke pengguna
+    res.status(201).json({
       status: "success",
-      message: "Model predicted successfully",
+      message: "Model is predicted successfully",
       data: resultData,
     });
   } catch (error) {
     console.error("Error during prediction: ", error);
-    return res.status(400).json({
+    res.status(400).json({
       status: "fail",
-      message: "Terjadi kesalahan dalam melakukan prediksi",
+      message: `Terjadi kesalahan dalam melakukan prediksi`,
     });
   }
 });
 
-// Endpoint to retrieve prediction history
+// Endpoint untuk mendapatkan riwayat prediksi
 app.get("/predict/histories", async (req, res) => {
   try {
-    const filePath = path.join(__dirname, "predictions.json");
+    const predictionsRef = db.collection("predictions");
+    const snapshot = await predictionsRef.get();
 
-    if (fs.existsSync(filePath)) {
-      const predictions = JSON.parse(fs.readFileSync(filePath));
+    const formattedPredictions = snapshot.docs.map((doc) => ({
+      id: doc.id,
+      history: doc.data(),
+    }));
 
-      // Format the history data as required
-      const formattedPredictions = predictions.map((prediction) => ({
-        id: prediction.id,
-        history: {
-          result: prediction.result,
-          createdAt: prediction.createdAt,
-          suggestion: prediction.suggestion,
-          id: prediction.id,
-        },
-      }));
-
-      return res.json({
-        status: "success",
-        data: formattedPredictions,
-      });
-    } else {
-      return res.json({
-        status: "success",
-        data: [],
-      });
-    }
+    res.json({
+      status: "success",
+      data: formattedPredictions,
+    });
   } catch (error) {
     console.error("Error fetching histories:", error);
-    return res.status(500).json({
+    res.status(500).json({
       status: "fail",
       message: "Terjadi kesalahan saat mengambil riwayat prediksi",
     });
   }
 });
 
-// Helper function to generate UUID (unique ID for each prediction)
+// Fungsi untuk menghasilkan UUID (ID unik untuk setiap prediksi)
 function generateUUID() {
   return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (c) {
     const r = (Math.random() * 16) | 0;
@@ -161,7 +143,18 @@ function generateUUID() {
   });
 }
 
-// Error handling for file size exceeded
+// Fungsi untuk menyimpan hasil prediksi ke Firestore
+async function savePredictionToFirestore(resultData) {
+  try {
+    await db.collection("predictions").doc(resultData.id).set(resultData);
+    console.log("Prediction saved to Firestore!");
+  } catch (error) {
+    console.error("Error saving prediction to Firestore:", error);
+    throw new Error("Failed to save prediction.");
+  }
+}
+
+// Menangani error file terlalu besar (lebih dari 1MB)
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
     return res.status(413).json({
@@ -169,10 +162,10 @@ app.use((err, req, res, next) => {
       message: "Payload content length greater than maximum allowed: 1000000",
     });
   }
-  next(err); // Pass on to the next error handler
+  next(err); // Lanjutkan ke error handler lainnya
 });
 
-// Start the server
+// Jalankan server
 app.listen(port, () => {
   console.log(`Server running on http://localhost:${port}`);
 });
